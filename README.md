@@ -3,6 +3,8 @@
 Brand every Omarchy surface from one wordmark — a line of text or a logo image —
 and keep the colours in step with your active theme.
 
+> AI Genrated code, which also requires elivated access (root) to update `initramfs`; use it at your own risk!!
+
 | Surface | Where it shows | What the tool changes |
 |---|---|---|
 | Session | lock screen saver and About | block-character art in `~/.config/omarchy/branding/` |
