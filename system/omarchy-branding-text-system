@@ -1,0 +1,428 @@
+#!/bin/bash
+
+# omarchy-branding-text-system — privileged half of `omarchy branding text`.
+#
+# Installs the SDDM login theme, the Plymouth splash theme and the Limine boot
+# menu title. It is the only command the Omarchy user may run through sudo, so
+# every path and value it accepts is fixed or validated here.
+
+set -uo pipefail
+
+PROG=omarchy-branding-text-system
+
+SDDM_THEME=omarchy-branding
+PLYMOUTH_THEME=omarchy-branding
+SDDM_STOCK=/usr/share/sddm/themes/omarchy
+PLYMOUTH_STOCK=/usr/share/plymouth/themes/omarchy
+SDDM_DIR=/usr/share/sddm/themes/$SDDM_THEME
+PLYMOUTH_DIR=/usr/share/plymouth/themes/$PLYMOUTH_THEME
+SDDM_CONF=/etc/sddm.conf.d/99-omarchy-branding.conf
+PLYMOUTH_CONF=/etc/plymouth/plymouthd.conf
+LIMINE_CONF=/boot/limine.conf
+LIMINE_BACKUP=$LIMINE_CONF.bak.omarchy-branding
+MARKER=.omarchy-branding-text
+SYSTEM_SHARE=/usr/local/share/omarchy-branding-text
+
+STOCK_BOOTMENU_TITLE="Omarchy Bootloader"
+STOCK_BOOTMENU_COLOR="9ece6a"
+
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+note() { printf '    %s\n' "$*"; }
+say() { printf '==> %s\n' "$*"; }
+
+(( EUID == 0 )) || die "must be run as root"
+
+# ---------------------------------------------------------------- arguments
+
+INVOKER=${SUDO_USER:-root}
+[[ $INVOKER =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unexpected invoking user"
+
+HOME_DIR=$(getent passwd "$INVOKER" | cut -d: -f6)
+[[ -n $HOME_DIR && $HOME_DIR == /* ]] || die "cannot resolve $INVOKER's home directory"
+STAGE=$HOME_DIR/.local/state/omarchy-branding-text/stage
+
+STOCK_UID=$(id -u "$INVOKER")
+
+validate_stage() {
+  [[ -d $STAGE && ! -L $STAGE ]] || die "staging directory missing: $STAGE"
+  [[ $(readlink -f "$STAGE") == "$STAGE" ]] || die "staging directory must not contain symlinks"
+  [[ $(stat -c %u "$STAGE") == "$STOCK_UID" ]] || die "staging directory is not owned by $INVOKER"
+  (( (8#$(stat -c %a "$STAGE") & 8#022) == 0 )) || die "staging directory is group/world writable"
+}
+
+require_file() {
+  local name=$1 file=$STAGE/$name
+  [[ -f $file && ! -L $file ]] || die "missing staged file: $name"
+  [[ $(stat -c %u "$file") == "$STOCK_UID" ]] || die "staged file $name is not owned by $INVOKER"
+  (( (8#$(stat -c %a "$file") & 8#022) == 0 )) || die "staged file $name is group/world writable"
+  printf '%s' "$file"
+}
+
+png_dimensions() {
+  magick identify -format '%w %h' "$1" 2>/dev/null
+}
+
+require_png() {
+  local name=$1 file width height
+  file=$(require_file "$name")
+  [[ $(head -c 8 "$file" | od -An -tx1 | tr -d ' \n') == 89504e470d0a1a0a ]] ||
+    die "staged file $name is not a PNG"
+  read -r width height <<<"$(png_dimensions "$file")"
+  [[ $width =~ ^[0-9]+$ && $height =~ ^[0-9]+$ ]] || die "cannot read $name dimensions"
+  (( width > 0 && height > 0 && width <= 4096 && height <= 4096 )) ||
+    die "staged file $name has an unsupported size"
+  printf '%s' "$file"
+}
+
+require_hex() {
+  local name=$1 value=$2
+  [[ $value =~ ^#[0-9a-fA-F]{6}$ ]] || die "$name must be #rrggbb"
+}
+
+require_limine_colour() {
+  [[ $1 =~ ^[0-9a-fA-F]{6}$ ]] || die "--color must be six hex digits"
+}
+
+require_title() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9\ ._:+\(\)\&-]{0,63}$ ]] ||
+    die "--title must be printable ASCII, at most 64 characters"
+}
+
+flag() {
+  [[ $1 == 0 || $1 == 1 ]] || die "$2 must be 0 or 1"
+}
+
+# ---------------------------------------------------------------- helpers
+
+marker() { printf '%s/%s\n' "$1" "$MARKER"; }
+
+own_theme_dir() {
+  local dir=$1
+  [[ -d $dir ]] || return 1
+  [[ -f $(marker "$dir") ]]
+}
+
+remove_theme_dir() {
+  local dir=$1
+  [[ -e $dir ]] || return 0
+  own_theme_dir "$dir" || die "refusing to remove $dir: it was not created by omarchy-branding-text"
+  rm -rf "$dir"
+}
+
+plymouth_current() {
+  plymouth-set-default-theme 2>/dev/null || true
+}
+
+socialise_permissions() {
+  local path=$1
+  chown -R root:root "$path"
+  find "$path" -type d -exec chmod 0755 {} +
+  find "$path" -type f -exec chmod 0644 {} +
+}
+
+sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# ---------------------------------------------------------------- login
+
+install_login() {
+  local logo accent background foreground red file
+  logo=$(require_png logo.png)
+  accent=$1 background=$2 foreground=$3 red=$4
+  require_hex accent "$accent"
+  require_hex background "$background"
+  require_hex foreground "$foreground"
+  require_hex red "$red"
+
+  [[ -d $SDDM_STOCK ]] || die "stock SDDM theme missing: $SDDM_STOCK"
+  [[ -f $SYSTEM_SHARE/Main.qml ]] || die "Main.qml missing: $SYSTEM_SHARE/Main.qml"
+
+  say "Login: installing SDDM theme '$SDDM_THEME'"
+  remove_theme_dir "$SDDM_DIR"
+  cp -a "$SDDM_STOCK" "$SDDM_DIR" || die "cannot copy $SDDM_STOCK"
+  : >"$(marker "$SDDM_DIR")"
+
+  install -m 0644 "$logo" "$SDDM_DIR/logo.png"
+  install -m 0644 "$SYSTEM_SHARE/Main.qml" "$SDDM_DIR/Main.qml"
+
+  cat >"$SDDM_DIR/brand.js" <<EOF
+var accent = "$accent";
+var background = "$background";
+var foreground = "$foreground";
+var red = "$red";
+EOF
+  chmod 0644 "$SDDM_DIR/brand.js"
+
+  for file in lock.png entry.png bullet.png lock-failed.png entry-failed.png; do
+    install -m 0644 "$(require_png "$file")" "$SDDM_DIR/$file"
+  done
+
+  sed -i -e 's/^Name=.*/Name=Omarchy Branding/' \
+    -e 's/^Description=.*/Description=Branded login screen from omarchy-branding-text./' \
+    "$SDDM_DIR/metadata.desktop"
+  sed -i 's/^Name=.*/Name=Omarchy Branding/' "$SDDM_DIR/theme.conf" 2>/dev/null || true
+
+  socialise_permissions "$SDDM_DIR"
+
+  printf '[Theme]\nCurrent=%s\n' "$SDDM_THEME" >"$SDDM_CONF.tmp"
+  chmod 0644 "$SDDM_CONF.tmp"
+  mv "$SDDM_CONF.tmp" "$SDDM_CONF"
+  note "$SDDM_DIR (accent $accent)"
+}
+
+revert_login() {
+  if [[ -f $SDDM_CONF ]]; then
+    say "Login: restoring the stock SDDM theme"
+    rm -f "$SDDM_CONF"
+  fi
+  if [[ -e $SDDM_DIR ]]; then
+    remove_theme_dir "$SDDM_DIR"
+  fi
+}
+
+# ---------------------------------------------------------------- splash
+
+install_splash() {
+  local logo rebuild_allowed=$1
+  logo=$(require_png logo.png)
+
+  [[ -d $PLYMOUTH_STOCK ]] || die "stock Plymouth theme missing: $PLYMOUTH_STOCK"
+
+  say "Splash: installing Plymouth theme '$PLYMOUTH_THEME'"
+  remove_theme_dir "$PLYMOUTH_DIR"
+  cp -a "$PLYMOUTH_STOCK" "$PLYMOUTH_DIR" || die "cannot copy $PLYMOUTH_STOCK"
+  : >"$(marker "$PLYMOUTH_DIR")"
+
+  (
+    cd "$PLYMOUTH_DIR" || exit 1
+    mv omarchy.plymouth "$PLYMOUTH_THEME.plymouth"
+    mv omarchy.script "$PLYMOUTH_THEME.script"
+    sed -i -e "s#^ImageDir=.*#ImageDir=$PLYMOUTH_DIR#" \
+      -e "s#^ScriptFile=.*#ScriptFile=$PLYMOUTH_DIR/$PLYMOUTH_THEME.script#" \
+      -e "s#/usr/share/plymouth/themes/omarchy/#$PLYMOUTH_DIR/#g" \
+      -e 's/^Name=.*/Name=Omarchy Branding/' \
+      -e 's/^Description=.*/Description=Branded splash screen from omarchy-branding-text./' \
+      "$PLYMOUTH_THEME.plymouth"
+  ) || die "cannot prepare the Plymouth theme"
+
+  install -m 0644 "$logo" "$PLYMOUTH_DIR/logo.png"
+  socialise_permissions "$PLYMOUTH_DIR"
+
+  # Plymouth reads the theme from the initramfs, so a theme that is not
+  # embedded yet must not become the default: an unbootable splash is worse
+  # than a stale one.
+  if (( rebuild_allowed == 1 )) || [[ $(plymouth_current) == "$PLYMOUTH_THEME" ]]; then
+    [[ -f $PLYMOUTH_CONF.bak.omarchy-branding ]] ||
+      cp -a "$PLYMOUTH_CONF" "$PLYMOUTH_CONF.bak.omarchy-branding" 2>/dev/null || true
+    plymouth-set-default-theme "$PLYMOUTH_THEME" >/dev/null || die "plymouth-set-default-theme failed"
+    note "$PLYMOUTH_DIR"
+  else
+    note "$PLYMOUTH_DIR (not selected until a rebuild embeds it)"
+  fi
+}
+
+revert_splash() {
+  local rebuild_allowed=$1
+  if [[ $(plymouth_current) == "$PLYMOUTH_THEME" ]] && (( rebuild_allowed == 0 )); then
+    note "splash stays active until a rebuild can remove it from the initramfs"
+    return 0
+  fi
+  if [[ $(plymouth_current) == "$PLYMOUTH_THEME" ]]; then
+    say "Splash: restoring the stock Plymouth theme"
+    plymouth-set-default-theme omarchy >/dev/null || true
+  fi
+  remove_theme_dir "$PLYMOUTH_DIR"
+}
+
+# ---------------------------------------------------------------- boot menu
+
+set_limine() {
+  local key=$1 value=$2 safe
+  [[ -n $value ]] || die "missing value for $key"
+  safe=$(sed_escape "$value")
+  if grep -q "^$key:" "$LIMINE_CONF"; then
+    sed -i "s#^$key:.*#$key: $safe#" "$LIMINE_CONF"
+  else
+    printf '%s: %s\n' "$key" "$value" >>"$LIMINE_CONF"
+  fi
+}
+
+install_bootmenu() {
+  local title=$1 colour=$2
+  require_title "$title"
+  require_limine_colour "$colour"
+
+  [[ -f $LIMINE_CONF ]] || {
+    note "no $LIMINE_CONF; skipping the boot menu"
+    return 0
+  }
+
+  say "Boot menu: title \"$title\""
+  [[ -f $LIMINE_BACKUP ]] || cp -a "$LIMINE_CONF" "$LIMINE_BACKUP"
+  set_limine interface_branding "$title"
+  set_limine interface_branding_color "$colour"
+  set_limine interface_help_color "$colour"
+  set_limine interface_help_color_bright "$colour"
+  note "$LIMINE_CONF (backup: $LIMINE_BACKUP)"
+}
+
+revert_bootmenu() {
+  [[ -f $LIMINE_CONF ]] || return 0
+  grep -q '^interface_branding:' "$LIMINE_CONF" || return 0
+  [[ $(sed -n 's/^interface_branding: //p' "$LIMINE_CONF" | head -1) == "$STOCK_BOOTMENU_TITLE" ]] && return 0
+  say "Boot menu: restoring the stock title"
+  [[ -f $LIMINE_BACKUP ]] || cp -a "$LIMINE_CONF" "$LIMINE_BACKUP"
+  set_limine interface_branding "$STOCK_BOOTMENU_TITLE"
+  set_limine interface_branding_color "$STOCK_BOOTMENU_COLOR"
+  set_limine interface_help_color "$STOCK_BOOTMENU_COLOR"
+  set_limine interface_help_color_bright "$STOCK_BOOTMENU_COLOR"
+}
+
+# ---------------------------------------------------------------- apply
+
+cmd_apply() {
+  local login=0 splash=0 bootmenu=0 rebuild_allowed=1 partial=0
+  local title="" colour="" accent="#A8CD76" background="#1a1b26" foreground="#C0CAF5" red="#F7768E"
+  local splash_was=0 generated=0
+
+  while (( $# > 0 )); do
+    case $1 in
+    --login=*) login=${1#*=} ;;
+    --splash=*) splash=${1#*=} ;;
+    --bootmenu=*) bootmenu=${1#*=} ;;
+    --rebuild=*) rebuild_allowed=${1#*=} ;;
+    --partial) partial=1 ;;
+    --title=*) title=${1#*=} ;;
+    --color=*) colour=${1#*=} ;;
+    --accent=*) accent=${1#*=} ;;
+    --background=*) background=${1#*=} ;;
+    --foreground=*) foreground=${1#*=} ;;
+    --red=*) red=${1#*=} ;;
+    *) die "unknown apply argument: $1" ;;
+    esac
+    shift
+  done
+
+  flag "$login" --login
+  flag "$splash" --splash
+  flag "$bootmenu" --bootmenu
+  flag "$rebuild_allowed" --rebuild
+
+  validate_stage
+  [[ -d /usr/share/sddm/themes ]] || die "SDDM is not installed"
+
+  if [[ -d $PLYMOUTH_DIR && -f $(marker "$PLYMOUTH_DIR") ]]; then
+    splash_was=1
+  fi
+
+  if (( login == 1 )); then
+    install_login "$accent" "$background" "$foreground" "$red"
+  elif (( partial == 0 )); then
+    revert_login
+  fi
+
+  if (( splash == 1 )); then
+    install_splash "$rebuild_allowed"
+  elif (( partial == 0 )) && (( splash_was == 1 )); then
+    revert_splash "$rebuild_allowed"
+  fi
+
+  if (( bootmenu == 1 )); then
+    install_bootmenu "$title" "$colour"
+  elif (( partial == 0 )); then
+    revert_bootmenu
+  fi
+
+  if (( rebuild_allowed == 1 )); then
+    if (( splash == 1 )) || { (( partial == 0 )) && (( splash_was == 1 )); }; then
+      say "Initramfs: embedding the splash (limine-mkinitcpio)"
+      generated=1
+      limine-mkinitcpio >/dev/null 2>&1 || {
+        printf '%s\n' "warning: limine-mkinitcpio failed; the splash will change on the next successful rebuild" >&2
+        generated=0
+      }
+      (( generated == 1 )) && note "embedded in the unified kernel image"
+    fi
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------- reset
+
+cmd_reset() {
+  local login=1 splash=1 bootmenu=1 rebuild=1 was=0
+
+  while (( $# > 0 )); do
+    case $1 in
+    --login=*) login=${1#*=} ;;
+    --splash=*) splash=${1#*=} ;;
+    --bootmenu=*) bootmenu=${1#*=} ;;
+    --rebuild=*) rebuild=${1#*=} ;;
+    *) die "unknown reset argument: $1" ;;
+    esac
+    shift
+  done
+
+  flag "$login" --login
+  flag "$splash" --splash
+  flag "$bootmenu" --bootmenu
+  flag "$rebuild" --rebuild
+
+  [[ -d $PLYMOUTH_DIR && -f $(marker "$PLYMOUTH_DIR") ]] && was=1
+
+  (( login == 1 )) && revert_login
+  (( splash == 1 )) && revert_splash "$rebuild"
+  (( bootmenu == 1 )) && revert_bootmenu
+
+  if (( rebuild == 1 && was == 1 )); then
+    say "Initramfs: removing the branded splash (limine-mkinitcpio)"
+    limine-mkinitcpio >/dev/null 2>&1 || printf '%s\n' "warning: limine-mkinitcpio failed" >&2
+    note "the stock splash is back on the next boot"
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+  local sddm_installed=0 plymouth_installed=0
+  [[ -d $SDDM_DIR && -f $(marker "$SDDM_DIR") ]] && sddm_installed=1
+  [[ -d $PLYMOUTH_DIR && -f $(marker "$PLYMOUTH_DIR") ]] && plymouth_installed=1
+
+  printf 'sddm_theme=%s\n' "$sddm_installed"
+  printf 'sddm_current=%s\n' "$(sed -n 's/^Current=//p' "$SDDM_CONF" 2>/dev/null | head -1)"
+  printf 'plymouth_theme=%s\n' "$plymouth_installed"
+  printf 'plymouth_current=%s\n' "$(plymouth_current)"
+  printf 'limine_title=%s\n' "$(sed -n 's/^interface_branding: //p' "$LIMINE_CONF" 2>/dev/null | head -1)"
+  printf 'limine_color=%s\n' "$(sed -n 's/^interface_branding_color: //p' "$LIMINE_CONF" 2>/dev/null | head -1)"
+  return 0
+}
+
+# ---------------------------------------------------------------- dispatch
+
+command=${1:-}
+[[ $# -gt 0 ]] && shift
+
+case $command in
+apply) cmd_apply "$@" ;;
+reset) cmd_reset "$@" ;;
+status) cmd_status ;;
+*)
+  cat <<'EOF'
+Usage: omarchy-branding-text-system <apply|reset|status> [options]
+
+apply --login=<0|1> --splash=<0|1> --bootmenu=<0|1> --rebuild=<0|1>
+      [--partial] [--title=<text>] [--color=<hex>]
+      [--accent=#rrggbb] [--background=#rrggbb]
+      [--foreground=#rrggbb] [--red=#rrggbb]
+reset [--login=<0|1>] [--splash=<0|1>] [--bootmenu=<0|1>] [--rebuild=<0|1>]
+status
+EOF
+  exit 1
+  ;;
+esac

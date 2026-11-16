@@ -1,0 +1,12 @@
+#!/bin/bash
+# Omarchy theme-set hook: repaint the branding in the new theme colours.
+THEME_NAME=${1:-}
+
+CLI="$HOME/.local/bin/omarchy-branding-text"
+if [[ ! -x $CLI ]]; then
+  CLI=$(command -v omarchy-branding-text 2>/dev/null || true)
+fi
+[[ -n $CLI ]] || exit 0
+
+"$CLI" hook >/dev/null 2>&1 || true
+exit 0

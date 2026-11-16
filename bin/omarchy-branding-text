@@ -1,0 +1,1499 @@
+#!/bin/bash
+
+# omarchy:summary=Brand every Omarchy surface from a text wordmark
+# omarchy:group=branding
+# omarchy:name=text
+# omarchy:args=[<text>|set [text]|ui|style <preset>|surface <name> <on|off>|option <key> <value>|get <key>|apply|preview|status|reset|config]
+# omarchy:examples=omarchy branding text ACME | omarchy branding text ui | omarchy branding text preview | omarchy branding text style heavy | omarchy branding text status
+
+set -uo pipefail
+
+PROG=omarchy-branding-text
+VERSION=1.1.0
+
+OMARCHY_HOME=${OMARCHY_PATH:-/usr/share/omarchy}
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-branding-text
+CONFIG_FILE=$CONFIG_DIR/config.conf
+DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-branding-text
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-branding-text
+STAGE=$STATE_DIR/stage
+PREVIEW=$STATE_DIR/preview
+THEME_STATE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current
+THEME_COLORS=$THEME_STATE/theme/colors.toml
+HELPER=/usr/local/sbin/omarchy-branding-text-system
+
+ART_SOURCE=$STATE_DIR/art-source.png
+
+# ---------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+  c_bold=$'\e[1m' c_dim=$'\e[2m' c_off=$'\e[0m'
+else
+  c_bold="" c_dim="" c_off=""
+fi
+
+say() { printf '%s==>%s %s\n' "$c_bold" "$c_off" "$*"; }
+note() { printf '    %s%s%s\n' "$c_dim" "$*" "$c_off"; }
+warn() { printf '%s%s%s\n' "$c_bold" "$*" "$c_off" >&2; }
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy branding text <command>
+
+Brand every Omarchy surface from one wordmark:
+the screensaver, About, SDDM login screen, Plymouth boot splash and Limine
+boot menu.
+
+Commands:
+  <text>                    Set the branding text and apply it
+  set [text]                Same as above; prompts when no text is given
+  ui                        Interactive settings editor (text, font, image, colours)
+  apply [--surfaces=a,b]    Re-render and reinstall the configured surfaces
+        [--no-rebuild]      Keep the current initramfs instead of rebuilding it
+  preview                   Print the generated terminal art and PNG path
+  style <preset>            narrow | heavy | wide | serif | mono | custom
+  surface <name> <on|off>   session | login | splash | bootmenu
+  option <key> <value>      Set any config key (see `config show`)
+  get <key>                 Print one config value
+  toggle <key>              Flip FOLLOW_THEME, THEME_UPDATE_SPLASH or REBUILD_INITRAMFS
+  status                    Show configuration, colours and installed state
+  reset                     Restore the stock Omarchy branding
+  config [show|path|edit]   Inspect or edit the configuration file
+
+Examples:
+  omarchy branding text ACME
+  omarchy branding text ui
+  omarchy branding text set "ACME LABS"
+  omarchy branding text style heavy
+  omarchy branding text option IMAGE ~/logo.png
+  omarchy branding text option COLORS fixed
+  omarchy branding text apply --surfaces=login,bootmenu --no-rebuild
+  omarchy branding text reset
+EOF
+}
+
+# ---------------------------------------------------------------- config
+
+config_defaults() {
+  TEXT="OMARCHY"
+  STYLE="narrow"
+  FONT=""
+  IMAGE=""
+  IMAGE_TINT="false"
+  LOGO_SIZE="800x188"
+  LETTER_SPACING=0
+  COLORS="theme"
+  ACCENT=""
+  BACKGROUND=""
+  FOREGROUND=""
+  RED=""
+  SURFACES="session,login,splash,bootmenu"
+  ART_WIDTH=81
+  ART_HEIGHT=10
+  ABOUT_WIDTH=54
+  ABOUT_HEIGHT=26
+  ART_THRESHOLD=50
+  BOOTMENU_TITLE=""
+  BOOTMENU_COLOR=""
+  FOLLOW_THEME="true"
+  THEME_UPDATE_SPLASH="false"
+  REBUILD_INITRAMFS="true"
+}
+
+theme_dir() { readlink -f "$THEME_STATE/theme" 2>/dev/null || true; }
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+theme_slug() {
+  local dir slug
+  dir=$(theme_dir)
+  slug=$(slugify "$(cat "$THEME_STATE/theme.name" 2>/dev/null || true)")
+  if [[ -n $slug ]]; then
+    printf '%s' "$slug"
+  elif [[ -n $dir ]]; then
+    basename "$dir"
+  else
+    printf 'unknown'
+  fi
+}
+
+theme_display_name() {
+  local name
+  name=$(cat "$THEME_STATE/theme.name" 2>/dev/null || true)
+  printf '%s' "${name:-$(theme_slug)}"
+}
+
+THEME_OVERRIDE=""
+
+load_config() {
+  config_defaults
+  if [[ -f $CONFIG_FILE ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE" || die "cannot read $CONFIG_FILE"
+  fi
+
+  local slug
+  local -a candidates=()
+  slug=$(theme_slug)
+  [[ -n $slug ]] && candidates+=("$slug")
+  [[ -n $(theme_dir) ]] && candidates+=("$(basename "$(theme_dir)")")
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f $CONFIG_DIR/themes/$candidate.conf ]]; then
+      THEME_OVERRIDE=$CONFIG_DIR/themes/$candidate.conf
+      # shellcheck disable=SC1090
+      source "$THEME_OVERRIDE"
+      break
+    fi
+  done
+
+  SURFACES=${SURFACES// /}
+  FOLLOW_THEME=$(printf '%s' "$FOLLOW_THEME" | tr '[:upper:]' '[:lower:]')
+  THEME_UPDATE_SPLASH=$(printf '%s' "$THEME_UPDATE_SPLASH" | tr '[:upper:]' '[:lower:]')
+  REBUILD_INITRAMFS=$(printf '%s' "$REBUILD_INITRAMFS" | tr '[:upper:]' '[:lower:]')
+  IMAGE_TINT=$(printf '%s' "$IMAGE_TINT" | tr '[:upper:]' '[:lower:]')
+  COLORS=$(printf '%s' "$COLORS" | tr '[:upper:]' '[:lower:]')
+}
+
+is_true() { [[ ${1:-} == true || ${1:-} == yes || ${1:-} == 1 || ${1:-} == on ]]; }
+
+config_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\\$/g' -e 's/`/\\`/g'
+}
+
+config_set() {
+  local key=$1 value=$2 escaped tmp
+  escaped=$(config_escape "$value")
+  mkdir -p "$CONFIG_DIR"
+  [[ -f $CONFIG_FILE ]] || printf '# omarchy-branding-text configuration\n' >"$CONFIG_FILE"
+  tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+  KEY="$key" VAL="$escaped" awk '
+    BEGIN { key = ENVIRON["KEY"]; val = ENVIRON["VAL"] }
+    $0 ~ "^[[:space:]]*" key "=" { print key "=\"" val "\""; found = 1; next }
+    { print }
+    END { if (!found) print key "=\"" val "\"" }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+config_key_case() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+known_key() {
+  case $1 in
+  TEXT | STYLE | FONT | IMAGE | IMAGE_TINT | LOGO_SIZE | LETTER_SPACING | COLORS | ACCENT | BACKGROUND | \
+    FOREGROUND | RED | SURFACES | ART_WIDTH | ART_HEIGHT | ABOUT_WIDTH | ABOUT_HEIGHT | ART_THRESHOLD | \
+    BOOTMENU_TITLE | BOOTMENU_COLOR | FOLLOW_THEME | THEME_UPDATE_SPLASH | REBUILD_INITRAMFS) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+config_value() {
+  local key=$1
+  load_config
+  printf '%s\n' "${!key-}"
+}
+
+# ---------------------------------------------------------------- colours
+
+read_theme_color() {
+  [[ -r $THEME_COLORS ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\(#[0-9a-fA-F]\{6\}\)\".*/\1/p" "$THEME_COLORS" | head -n1
+}
+
+valid_hex() { [[ ${1:-} =~ ^#[0-9a-fA-F]{6}$ ]]; }
+
+# Stock Omarchy palette, used only when the active theme (or the user) does not
+# provide a colour. Keep this in step with the stock theme in Omarchy.
+STOCK_ACCENT="#A8CD76"
+STOCK_BACKGROUND="#1a1b26"
+STOCK_FOREGROUND="#C0CAF5"
+STOCK_RED="#F7768E"
+
+ACCENT_RESOLVED=$STOCK_ACCENT
+BACKGROUND_RESOLVED=$STOCK_BACKGROUND
+FOREGROUND_RESOLVED=$STOCK_FOREGROUND
+RED_RESOLVED=$STOCK_RED
+USING_THEME_COLORS=false
+
+resolve_colors() {
+  local theme_accent="" theme_background="" theme_foreground="" theme_red=""
+
+  if [[ $COLORS == theme ]]; then
+    USING_THEME_COLORS=true
+    theme_accent=$(read_theme_color accent)
+    theme_background=$(read_theme_color background)
+    theme_foreground=$(read_theme_color foreground)
+    theme_red=$(read_theme_color red)
+
+    ACCENT_RESOLVED=${theme_accent:-$STOCK_ACCENT}
+    BACKGROUND_RESOLVED=${theme_background:-$STOCK_BACKGROUND}
+    FOREGROUND_RESOLVED=${theme_foreground:-$STOCK_FOREGROUND}
+    RED_RESOLVED=${theme_red:-$STOCK_RED}
+  else
+    USING_THEME_COLORS=false
+    ACCENT_RESOLVED=${ACCENT:-$STOCK_ACCENT}
+    BACKGROUND_RESOLVED=${BACKGROUND:-$STOCK_BACKGROUND}
+    FOREGROUND_RESOLVED=${FOREGROUND:-$STOCK_FOREGROUND}
+    RED_RESOLVED=${RED:-$STOCK_RED}
+  fi
+
+  valid_hex "$ACCENT_RESOLVED" || die "ACCENT must be #rrggbb, got '$ACCENT_RESOLVED'"
+  valid_hex "$BACKGROUND_RESOLVED" || die "BACKGROUND must be #rrggbb, got '$BACKGROUND_RESOLVED'"
+  valid_hex "$FOREGROUND_RESOLVED" || die "FOREGROUND must be #rrggbb, got '$FOREGROUND_RESOLVED'"
+  valid_hex "$RED_RESOLVED" || die "RED must be #rrggbb, got '$RED_RESOLVED'"
+}
+
+# ---------------------------------------------------------------- surfaces
+
+want_surface() { [[ ",$SURFACES," == *",$1,"* ]]; }
+
+any_system_surface() {
+  want_surface login || want_surface splash || want_surface bootmenu
+}
+
+surface_list() {
+  local s out=()
+  local -a all=(session login splash bootmenu)
+  for s in "${all[@]}"; do
+    want_surface "$s" && out+=("$s")
+  done
+  (IFS=,; printf '%s' "${out[*]}")
+}
+
+# ---------------------------------------------------------------- rendering
+
+font_for_style() {
+  local preset=${STYLE:-narrow} candidate
+  local -a fallbacks
+
+  if [[ -n ${FONT:-} ]]; then
+    [[ -f $FONT ]] || die "FONT does not exist: $FONT"
+    printf '%s' "$FONT"
+    return 0
+  fi
+
+  case $preset in
+  narrow) fallbacks=(/usr/share/fonts/gsfonts/NimbusSansNarrow-Bold.otf /usr/share/fonts/gsfonts/NimbusSans-Bold.otf) ;;
+  heavy) fallbacks=(/usr/share/fonts/noto/NotoSans-Black.ttf /usr/share/fonts/noto/NotoSans-Bold.ttf /usr/share/fonts/liberation/LiberationSans-Bold.ttf) ;;
+  wide) fallbacks=(/usr/share/fonts/liberation/LiberationSans-Bold.ttf /usr/share/fonts/gsfonts/NimbusSans-Bold.otf) ;;
+  serif) fallbacks=(/usr/share/fonts/gsfonts/NimbusRoman-Bold.otf /usr/share/fonts/gsfonts/P052-Bold.otf) ;;
+  mono) fallbacks=(/usr/share/fonts/gsfonts/NimbusMonoPS-Bold.otf) ;;
+  custom) die "STYLE=custom needs FONT set to a font file" ;;
+  *) die "unknown STYLE '${STYLE}'; use narrow, heavy, wide, serif, mono or custom" ;;
+  esac
+
+  for candidate in "${fallbacks[@]}"; do
+    if [[ -f $candidate ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  die "no font found for STYLE='$preset'"
+}
+
+# Characters in <text> that <font> has no glyphs for. Fontconfig knows the
+# font's cmap, so this needs no rendering. Icon fonts such as
+# /usr/share/fonts/omarchy/omarchy.ttf only carry a handful of letters and are
+# the usual culprit.
+font_missing_chars() {
+  local font=$1 text=$2 charset token start end ch code seen="" missing="" found
+  command -v fc-query >/dev/null 2>&1 || return 0
+  charset=$(fc-query --format '%{charset}' "$font" 2>/dev/null | tr '\n' ' ')
+  [[ -n $charset ]] || return 0
+
+  local -a ranges=()
+  read -r -a ranges <<<"$charset"
+
+  while IFS= read -r -n1 ch; do
+    [[ -z $ch || $ch == ' ' ]] && continue
+    [[ $seen == *"$ch"* ]] && continue
+    seen+=$ch
+    code=$(printf '%d' "'$ch" 2>/dev/null) || continue
+    [[ $code =~ ^[0-9]+$ ]] || continue
+    found=0
+    for token in "${ranges[@]}"; do
+      start=${token%-*}
+      end=${token#*-}
+      [[ $end == "$token" ]] && end=$start
+      if (( 16#$start <= code && code <= 16#$end )); then
+        found=1
+        break
+      fi
+    done
+    (( found )) || missing+=$ch
+  done <<<"$text"
+  printf '%s' "$missing"
+}
+
+# Describe why <font> cannot render TEXT; print nothing when it can. The
+# rendering probe is the definitive test: a font with no matching glyphs draws
+# a blank 1px label, which is what makes ImageMagick print
+# "geometry does not contain image".
+font_problem() {
+  local font=$1 missing coverage list
+  missing=$(font_missing_chars "$font" "${TEXT:-}")
+  if [[ -n $missing ]]; then
+    list=$(printf '%s' "$missing" | sed 's/./& /g')
+    printf '%s cannot draw "%s" (no glyphs for: %s)' "$font" "${TEXT:-}" "${list% }"
+    return 1
+  fi
+  coverage=$(magick -background none -font "$font" -pointsize 64 "label:${TEXT:-}" \
+    -format '%[fx:maxima.a]' info: 2>/dev/null) || coverage=0
+  if [[ $coverage =~ ^0(\.0+)?$ ]]; then
+    printf '%s cannot draw "%s" (it renders nothing)' "$font" "${TEXT:-}"
+    return 1
+  fi
+  return 0
+}
+
+# Refuse to install a blank wordmark. Without this the render "succeeds" with an
+# empty image and the branding ends up blank (or a solid block of art).
+validate_font() {
+  image_is_set && return 0
+  local font problem
+  font=$(font_for_style) || return 0 # font_for_style already said what is wrong
+  problem=$(font_problem "$font") && return 0
+  die "cannot draw the wordmark: $problem. Icon fonts cannot draw lettering; pick another font with 'omarchy branding text ui' or set FONT to a text font."
+}
+
+validate_text() {
+  if [[ -n ${IMAGE:-} ]]; then
+    [[ $TEXT != @* ]] || die "TEXT must not start with '@'"
+    [[ $TEXT != *[$'\n\r\t']* ]] || die "TEXT must be a single line"
+    (( ${#TEXT} <= 64 )) || die "TEXT must be at most 64 characters"
+    return 0
+  fi
+  [[ -n ${TEXT// /} ]] || die "TEXT is empty; set IMAGE for image-only branding"
+  [[ $TEXT != @* ]] || die "TEXT must not start with '@'"
+  [[ $TEXT != *[$'\n\r\t']* ]] || die "TEXT must be a single line"
+  (( ${#TEXT} <= 64 )) || die "TEXT must be at most 64 characters"
+}
+
+require_image() {
+  [[ -n ${IMAGE:-} ]] || return 0
+  [[ -f $IMAGE ]] || die "IMAGE does not exist: $IMAGE"
+  [[ -r $IMAGE ]] || die "IMAGE is not readable: $IMAGE"
+  magick identify -format '%w' "$IMAGE" >/dev/null 2>&1 || die "IMAGE is not an image: $IMAGE"
+}
+
+image_is_set() { [[ -n ${IMAGE:-} ]]; }
+
+logo_dimensions() {
+  LOGO_WIDTH=${LOGO_SIZE%x*}
+  LOGO_HEIGHT=${LOGO_SIZE#*x}
+  [[ $LOGO_WIDTH =~ ^[0-9]+$ && $LOGO_HEIGHT =~ ^[0-9]+$ ]] ||
+    die "LOGO_SIZE must look like 800x188, got '$LOGO_SIZE'"
+  LOGO_WIDTH=$((10#$LOGO_WIDTH))
+  LOGO_HEIGHT=$((10#$LOGO_HEIGHT))
+  (( LOGO_WIDTH >= 64 && LOGO_WIDTH <= 4096 && LOGO_HEIGHT >= 16 && LOGO_HEIGHT <= 4096 )) ||
+    die "LOGO_SIZE is out of range: $LOGO_SIZE"
+}
+
+render_wordmark() {
+  local out=$1 font
+  logo_dimensions
+  mkdir -p "$(dirname "$out")"
+
+  if image_is_set; then
+    require_image
+    local -a tint=()
+    is_true "$IMAGE_TINT" && tint=(-fill "$ACCENT_RESOLVED" -colorize 100)
+    magick -background none -density 384 "$IMAGE" -auto-orient -trim +repage "${tint[@]}" \
+      -resize "${LOGO_WIDTH}x${LOGO_HEIGHT}" \
+      -background none -gravity center -extent "${LOGO_WIDTH}x${LOGO_HEIGHT}" \
+      "PNG32:$out" || die "could not render the image wordmark: $IMAGE"
+    return 0
+  fi
+
+  font=$(font_for_style)
+  magick -background none -fill "$ACCENT_RESOLVED" -font "$font" -pointsize 400 \
+    -kerning "${LETTER_SPACING:-0}" "label:$TEXT" -trim +repage \
+    -resize "${LOGO_WIDTH}x${LOGO_HEIGHT}" \
+    -background none -gravity center -extent "${LOGO_WIDTH}x${LOGO_HEIGHT}" \
+    "PNG32:$out" || die "could not render the wordmark (is ImageMagick installed?)"
+}
+
+render_art_source() {
+  local out=$1 font
+  mkdir -p "$(dirname "$out")"
+
+  if image_is_set; then
+    require_image
+    magick -background none -density 384 "$IMAGE" -auto-orient \
+      -trim +repage "PNG32:$out" || die "could not prepare the image art source"
+    return 0
+  fi
+
+  font=$(font_for_style)
+  magick -background none -fill white -font "$font" -pointsize 400 \
+    -kerning "${LETTER_SPACING:-0}" "label:$TEXT" -trim +repage "PNG32:$out" ||
+    die "could not render the art source"
+}
+
+render_art() {
+  local width=$1 height=$2 out=$3
+  [[ $width =~ ^[0-9]+$ && $height =~ ^[0-9]+$ ]] || die "art bounds must be numbers"
+  width=$((10#$width))
+  height=$((10#$height))
+  [[ $ART_THRESHOLD =~ ^[0-9]+$ ]] || die "ART_THRESHOLD must be a number from 0 to 100"
+  ART_THRESHOLD=$((10#$ART_THRESHOLD))
+  (( ART_THRESHOLD >= 0 && ART_THRESHOLD <= 100 )) || die "ART_THRESHOLD must be from 0 to 100"
+  omarchy-transcode-ascii "$ART_SOURCE" "$out" --mode block --width "$width" --height "$height" \
+    --threshold "$ART_THRESHOLD" >/dev/null ||
+    die "omarchy-transcode-ascii failed"
+}
+
+# ---------------------------------------------------------------- session
+
+backup_once() {
+  local target=$1 backup=$1.bak.omarchy-branding
+  if [[ -f $target && ! -f $backup ]]; then
+    cp -a "$target" "$backup"
+  fi
+}
+
+install_user_file() {
+  local src=$1 dest=$2
+  mkdir -p "$(dirname "$dest")"
+  backup_once "$dest"
+  local tmp
+  tmp=$(mktemp "$(dirname "$dest")/.$(basename "$dest").XXXXXX")
+  cp "$src" "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$dest"
+}
+
+session_branding_dir() { printf '%s/.config/omarchy/branding' "$HOME"; }
+
+stage_session() {
+  local dir
+  dir=$(session_branding_dir)
+  mkdir -p "$STAGE"
+  say "Session: screensaver and About"
+  render_art "$ART_WIDTH" "$ART_HEIGHT" "$STAGE/screensaver.txt"
+  render_art "$ABOUT_WIDTH" "$ABOUT_HEIGHT" "$STAGE/about.txt"
+  install_user_file "$STAGE/screensaver.txt" "$dir/screensaver.txt"
+  install_user_file "$STAGE/about.txt" "$dir/about.txt"
+  note "screensaver $(wc -l <"$STAGE/screensaver.txt") lines, about $(wc -l <"$STAGE/about.txt") lines"
+}
+
+reset_session() {
+  local dir
+  dir=$(session_branding_dir)
+  mkdir -p "$dir"
+  backup_once "$dir/screensaver.txt"
+  backup_once "$dir/about.txt"
+  cp "$OMARCHY_HOME/logo.txt" "$dir/screensaver.txt"
+  cp "$OMARCHY_HOME/icon.txt" "$dir/about.txt"
+  say "Session: restored the stock screensaver and About art"
+}
+
+# ---------------------------------------------------------------- login stage
+
+recolor_icon() {
+  local source=$1 dest=$2 colour=$3
+  [[ -f $source ]] || die "missing stock SDDM asset: $source"
+  magick "$source" -fill "$colour" -colorize 100 "PNG32:$dest" ||
+    die "could not recolour $(basename "$source")"
+}
+
+stage_login() {
+  local stock=/usr/share/sddm/themes/omarchy
+
+  say "Login: SDDM theme assets"
+  render_wordmark "$STAGE/logo.png"
+
+  recolor_icon "$stock/lock.png" "$STAGE/lock.png" "$FOREGROUND_RESOLVED"
+  recolor_icon "$stock/entry.png" "$STAGE/entry.png" "$FOREGROUND_RESOLVED"
+  recolor_icon "$stock/bullet.png" "$STAGE/bullet.png" "$FOREGROUND_RESOLVED"
+  recolor_icon "$stock/lock-failed.png" "$STAGE/lock-failed.png" "$RED_RESOLVED"
+  recolor_icon "$stock/entry-failed.png" "$STAGE/entry-failed.png" "$RED_RESOLVED"
+  note "accent $ACCENT_RESOLVED, widget $FOREGROUND_RESOLVED, failure $RED_RESOLVED"
+}
+
+# ---------------------------------------------------------------- root helper
+
+run_helper() {
+  [[ -x $HELPER ]] || die "system helper missing at $HELPER; run install.sh first"
+  if (( EUID == 0 )); then
+    "$HELPER" "$@"
+  elif sudo -n "$HELPER" status >/dev/null 2>&1; then
+    sudo -n "$HELPER" "$@"
+  else
+    sudo "$HELPER" "$@"
+  fi
+}
+
+helper_status() {
+  [[ -x $HELPER ]] || return 0
+  if (( EUID == 0 )); then
+    "$HELPER" status
+  elif sudo -n "$HELPER" status >/dev/null 2>&1; then
+    sudo -n "$HELPER" status
+  else
+    sudo "$HELPER" status
+  fi
+}
+
+bootmenu_title() {
+  local title=${BOOTMENU_TITLE:-${TEXT^^}}
+  # Limine's branding line is printable ASCII; strip anything else.
+  title=$(printf '%s' "$title" | LC_ALL=C sed 's/[^A-Za-z0-9 ._:+()\&-]//g' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -n $title ]] || title="Omarchy"
+  printf '%s' "${title:0:64}"
+}
+
+bootmenu_colour() {
+  local colour=${BOOTMENU_COLOR:-${ACCENT_RESOLVED#\#}}
+  colour=${colour#\#}
+  [[ $colour =~ ^[0-9a-fA-F]{6}$ ]] || colour=${ACCENT_RESOLVED#\#}
+  printf '%s' "$colour"
+}
+
+# ---------------------------------------------------------------- apply
+
+cmd_apply() {
+  local surfaces_override="" rebuild_override="" quiet=false
+  local arg
+
+  while (( $# > 0 )); do
+    case $1 in
+    --surfaces=*) surfaces_override=${1#*=} ;;
+    --surfaces)
+      shift
+      [[ $# -gt 0 ]] || die "--surfaces needs a value"
+      surfaces_override=$1
+      ;;
+    --no-rebuild) rebuild_override=false ;;
+    --rebuild) rebuild_override=true ;;
+    --quiet | -q) quiet=true ;;
+    --help | -h)
+      usage
+      return 0
+      ;;
+    *) die "unknown apply option: $1" ;;
+    esac
+    shift
+  done
+
+  load_config
+  [[ -z $surfaces_override ]] || SURFACES=${surfaces_override// /}
+  [[ -z $rebuild_override ]] || REBUILD_INITRAMFS=$rebuild_override
+
+  local surface
+  local -a requested=()
+  IFS=, read -r -a requested <<<"$SURFACES"
+  for surface in "${requested[@]}"; do
+    [[ -z $surface ]] && continue
+    case $surface in
+    session | login | splash | bootmenu) ;;
+    *) die "unknown surface '$surface'; use session, login, splash or bootmenu" ;;
+    esac
+  done
+
+  validate_text
+  validate_font
+  resolve_colors
+
+  # Drop stale artifacts from earlier runs so a failed render never leaves a
+  # half-written stage behind.
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE"
+
+  if ! $quiet; then
+    say "Branding \"$TEXT\""
+    note "theme $(theme_display_name) ($(theme_slug)), colours from ${COLORS}"
+  fi
+
+  if want_surface session; then
+    render_art_source "$ART_SOURCE"
+    stage_session
+  fi
+
+  if want_surface login; then
+    stage_login
+  elif want_surface splash; then
+    render_wordmark "$STAGE/logo.png"
+  fi
+
+  if any_system_surface; then
+    local login=0 splash=0 bootmenu=0 rebuild=0 title colour
+    want_surface login && login=1
+    want_surface splash && splash=1
+    want_surface bootmenu && bootmenu=1
+    title=$(bootmenu_title)
+    colour=$(bootmenu_colour)
+    is_true "$REBUILD_INITRAMFS" && rebuild=1
+
+    local -a helper_args=(apply --login="$login" --splash="$splash" --bootmenu="$bootmenu"
+      --title="$title" --color="$colour" --rebuild="$rebuild"
+      --accent="$ACCENT_RESOLVED" --background="$BACKGROUND_RESOLVED"
+      --foreground="$FOREGROUND_RESOLVED" --red="$RED_RESOLVED")
+    [[ -n $surfaces_override ]] && helper_args+=(--partial)
+
+    run_helper "${helper_args[@]}" || die "the system helper failed; the branding was only partly installed"
+  fi
+
+  if ! $quiet; then
+    printf '\n'
+    say "Done"
+    note "surfaces   $(surface_list)"
+    note "accent     $ACCENT_RESOLVED"
+    note "background $BACKGROUND_RESOLVED"
+    [[ -n $THEME_OVERRIDE ]] && note "override   $THEME_OVERRIDE"
+    if want_surface login; then
+      note "login      log out to see it (autologin skips the greeter at boot)"
+    fi
+    if want_surface splash; then
+      if [[ $REBUILD_INITRAMFS == true ]]; then
+        note "splash     embedded in the initramfs; pick it up on the next boot"
+      else
+        note "splash     staged but not embedded (run with --rebuild to update the initramfs)"
+      fi
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- preview
+
+cmd_preview() {
+  local open=false
+  while (( $# > 0 )); do
+    case $1 in
+    --open) open=true ;;
+    --help | -h)
+      usage
+      return 0
+      ;;
+    *) die "unknown preview option: $1" ;;
+    esac
+    shift
+  done
+
+  load_config
+  validate_text
+  validate_font
+  resolve_colors
+  mkdir -p "$PREVIEW"
+  render_wordmark "$PREVIEW/logo.png"
+  render_art_source "$ART_SOURCE"
+  render_art "$ART_WIDTH" "$ART_HEIGHT" "$PREVIEW/screensaver.txt"
+  render_art "$ABOUT_WIDTH" "$ABOUT_HEIGHT" "$PREVIEW/about.txt"
+
+  printf '%s%s%s  (%s, %s px)\n' "$c_bold" "$TEXT" "$c_off" "$STYLE" "$LOGO_SIZE"
+  printf 'theme %s (%s) - accent %s, background %s\n\n' \
+    "$(theme_display_name)" "$(theme_slug)" "$ACCENT_RESOLVED" "$BACKGROUND_RESOLVED"
+
+  printf '%s-- screensaver (%sx%s) --%s\n' "$c_bold" "$ART_WIDTH" "$ART_HEIGHT" "$c_off"
+  cat "$PREVIEW/screensaver.txt"
+  printf '\n%s-- about (%sx%s) --%s\n' "$c_bold" "$ABOUT_WIDTH" "$ABOUT_HEIGHT" "$c_off"
+  cat "$PREVIEW/about.txt"
+  printf '\n%s-- login / splash wordmark --%s\n' "$c_bold" "$c_off"
+  printf '  %s\n' "$PREVIEW/logo.png"
+  printf '  boot menu title: %s (%s)\n' "$(bootmenu_title)" "$(bootmenu_colour)"
+
+  if $open; then
+    setsid xdg-open "$PREVIEW/logo.png" >/dev/null 2>&1 &
+  fi
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+  load_config
+  resolve_colors
+
+  printf '%sBranding%s\n' "$c_bold" "$c_off"
+  printf '  text        %s\n' "${TEXT:-(none)}"
+  if [[ -n ${IMAGE:-} ]]; then
+    printf '  image       %s%s\n' "$IMAGE" "$([[ $IMAGE_TINT == true ]] && printf ' (tinted with the accent)')"
+  fi
+  printf '  style       %s (%s)\n' "$STYLE" "$(font_for_style 2>/dev/null || printf 'n/a')"
+  if ! image_is_set; then
+    local status_font status_problem
+    if status_font=$(font_for_style 2>/dev/null) && ! status_problem=$(font_problem "$status_font"); then
+      printf '  font issue  %s\n' "$status_problem"
+    fi
+  fi
+  printf '  logo box    %s\n' "$LOGO_SIZE"
+  printf '  surfaces    %s\n' "$(surface_list)"
+  printf '\n%sTheme%s\n' "$c_bold" "$c_off"
+  printf '  current     %s (%s)\n' "$(theme_display_name)" "$(theme_slug)"
+  printf '  colours     %s%s\n' "$COLORS" "$([[ $COLORS == theme ]] && printf ' - accent %s, background %s, foreground %s, red %s' "$ACCENT_RESOLVED" "$BACKGROUND_RESOLVED" "$FOREGROUND_RESOLVED" "$RED_RESOLVED")"
+  printf '  follow      %s (splash on change: %s)\n' "$FOLLOW_THEME" "$THEME_UPDATE_SPLASH"
+  printf '  override    %s\n' "${THEME_OVERRIDE:-(none)}"
+  printf '\n%sSystem%s\n' "$c_bold" "$c_off"
+
+  local line key value
+  while IFS='=' read -r key value; do
+    [[ -n $key ]] || continue
+    case $key in
+    sddm_theme) printf '  login       %s\n' "$([[ $value == 1 ]] && echo installed || echo absent)" ;;
+    sddm_current) printf '  sddm theme  %s\n' "$value" ;;
+    plymouth_theme) printf '  splash      %s\n' "$([[ $value == 1 ]] && echo installed || echo absent)" ;;
+    plymouth_current) printf '  plymouth    %s\n' "$value" ;;
+    limine_title) printf '  boot menu   %s\n' "$value" ;;
+    limine_color) printf '  menu colour %s\n' "$value" ;;
+    esac
+  done < <(helper_status 2>/dev/null || true)
+
+  printf '  config      %s\n' "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------- mutations
+
+ensure_config() {
+  mkdir -p "$CONFIG_DIR/themes"
+  [[ -f $CONFIG_FILE ]] && return 0
+
+  # The installer normally writes the commented template. If it is missing,
+  # write the currently loaded defaults so the file exists for later edits.
+  local key value
+  {
+    printf '# omarchy-branding-text configuration\n'
+    printf '# Reinstall the plugin to get the full commented template.\n'
+    for key in TEXT STYLE FONT IMAGE IMAGE_TINT LOGO_SIZE LETTER_SPACING COLORS ACCENT BACKGROUND \
+      FOREGROUND RED SURFACES ART_WIDTH ART_HEIGHT ABOUT_WIDTH ABOUT_HEIGHT ART_THRESHOLD \
+      BOOTMENU_TITLE BOOTMENU_COLOR FOLLOW_THEME THEME_UPDATE_SPLASH REBUILD_INITRAMFS; do
+      value=$(config_escape "${!key-}")
+      printf '%s="%s"\n' "$key" "$value"
+    done
+  } >"$CONFIG_FILE"
+  chmod 0644 "$CONFIG_FILE"
+}
+
+cmd_set() {
+  local text=""
+  if (( $# > 0 )); then
+    text="$*"
+  elif [[ -t 0 ]]; then
+    printf 'Branding text: '
+    IFS= read -r text || true
+  elif command -v omarchy-menu-input >/dev/null 2>&1; then
+    text=$(omarchy-menu-input "Branding text") || die "no text given"
+  else
+    die "no text given; usage: omarchy branding text set <text>"
+  fi
+
+  [[ -n ${text// /} ]] || die "no text given"
+  ensure_config
+  config_set TEXT "$text"
+  say "Saved branding text: $text"
+  cmd_apply
+}
+
+cmd_style() {
+  local preset=${1:-}
+  case $preset in
+  narrow | heavy | wide | serif | mono) ;;
+  custom)
+    [[ -n ${FONT:-} ]] || die "STYLE=custom needs FONT set; use: omarchy branding text option FONT /path/to/font.ttf"
+    ;;
+  *) die "usage: omarchy branding text style narrow|heavy|wide|serif|mono|custom" ;;
+  esac
+  ensure_config
+  config_set STYLE "$preset"
+  say "Style: $preset"
+  cmd_apply
+}
+
+cmd_surface() {
+  local name=${1:-} state=${2:-}
+  case $name in
+  session | login | splash | bootmenu) ;;
+  *) die "usage: omarchy branding text surface session|login|splash|bootmenu on|off" ;;
+  esac
+  case $state in
+  on | off) ;;
+  *) die "surface state must be on or off" ;;
+  esac
+
+  load_config
+  local -a current=()
+  local s
+  IFS=, read -r -a current <<<"$SURFACES"
+  local -a next=()
+  for s in "${current[@]}"; do
+    [[ -n $s && $s != "$name" ]] && next+=("$s")
+  done
+  [[ $state == on ]] && next+=("$name")
+
+  local joined
+  joined=$(IFS=,; printf '%s' "${next[*]}")
+  [[ -n $joined ]] || die "at least one surface must stay enabled"
+
+  ensure_config
+  config_set SURFACES "$joined"
+  say "Surfaces: $joined"
+  cmd_apply
+}
+
+cmd_option() {
+  local key value
+  key=$(config_key_case "${1:-}")
+  value=${2:-}
+  [[ -n $key && $# -ge 2 ]] || die "usage: omarchy branding text option <key> <value>"
+  known_key "$key" || die "unknown option '$key'; see: omarchy branding text config show"
+
+  ensure_config
+  config_set "$key" "$value"
+  say "Set $key=$value"
+  cmd_apply
+}
+
+cmd_get() {
+  local key
+  key=$(config_key_case "${1:-}")
+  known_key "$key" || die "unknown option '$key'"
+  config_value "$key"
+}
+
+cmd_toggle() {
+  local key current
+  key=$(config_key_case "${1:-}")
+  case $key in
+  FOLLOW_THEME | THEME_UPDATE_SPLASH | REBUILD_INITRAMFS) ;;
+  *) die "only FOLLOW_THEME, THEME_UPDATE_SPLASH and REBUILD_INITRAMFS can be toggled" ;;
+  esac
+
+  current=$(config_value "$key")
+  if is_true "$current"; then
+    ensure_config
+    config_set "$key" false
+    say "$key disabled"
+  else
+    ensure_config
+    config_set "$key" true
+    say "$key enabled"
+  fi
+}
+
+cmd_reset() {
+  local rebuild=true
+  while (( $# > 0 )); do
+    case $1 in
+    --no-rebuild) rebuild=false ;;
+    --rebuild) rebuild=true ;;
+    --help | -h)
+      usage
+      return 0
+      ;;
+    *) die "unknown reset option: $1" ;;
+    esac
+    shift
+  done
+
+  load_config
+  reset_session
+
+  local splash=0
+  if [[ -x $HELPER ]]; then
+    if [[ -d /usr/share/plymouth/themes/omarchy-branding ]] && is_true "$rebuild"; then
+      splash=1
+    fi
+    run_helper reset --login=1 --splash=1 --bootmenu=1 --rebuild="$splash" ||
+      die "the system helper failed to restore the stock branding"
+  fi
+
+  say "Done - the stock Omarchy branding is back (kept $CONFIG_FILE)"
+}
+
+cmd_config() {
+  case ${1:-show} in
+  show | cat)
+    ensure_config
+    cat "$CONFIG_FILE"
+    ;;
+  path)
+    printf '%s\n' "$CONFIG_FILE"
+    ;;
+  edit)
+    ensure_config
+    local editor=${VISUAL:-${EDITOR:-}}
+    if [[ -z $editor ]]; then
+      if command -v omarchy-launch-editor >/dev/null 2>&1; then
+        omarchy-launch-editor "$CONFIG_FILE"
+        return 0
+      fi
+      editor=nano
+    fi
+    "$editor" "$CONFIG_FILE"
+    ;;
+  *) die "usage: omarchy branding text config [show|path|edit]" ;;
+  esac
+}
+
+cmd_hook() {
+  load_config
+  is_true "$FOLLOW_THEME" || return 0
+  [[ $COLORS == theme ]] || return 0
+
+  local surfaces=""
+  want_surface login && surfaces="login"
+  if want_surface bootmenu; then
+    surfaces=${surfaces:+$surfaces,}bootmenu
+  fi
+  if want_surface splash && is_true "$THEME_UPDATE_SPLASH"; then
+    surfaces=${surfaces:+$surfaces,}splash
+  fi
+  [[ -n $surfaces ]] || return 0
+
+  local -a args=(apply --surfaces="$surfaces" --quiet)
+  [[ $surfaces == *splash* ]] && args+=(--rebuild)
+  cmd_apply "${args[@]}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- interactive editor
+
+ui_need_gum() {
+  command -v gum >/dev/null 2>&1 || die "the settings UI needs gum (install gum)"
+}
+
+# Cancelling a gum menu prints "nothing selected" on stderr. Keep the wrappers
+# so the call sites stay uniform, but never redirect gum's stderr: gum draws its
+# interface there, so redirecting it makes the menu disappear.
+ui_gum_choose() { command gum choose "$@"; }
+ui_gum_input() { command gum input "$@"; }
+ui_gum_confirm() { command gum confirm "$@"; }
+ui_gum_file() { command gum file "$@"; }
+ui_gum_filter() { command gum filter "$@"; }
+ui_gum_pager() { command gum pager "$@"; }
+
+ui_pause() {
+  printf '\n'
+  read -r -p "Press Enter to return to settings…" _ || true
+}
+
+ui_check() {
+  [[ ${1:-} == "${2:-}" ]] && printf '  ✓'
+}
+
+ui_validate_colours() {
+  local key
+  for key in ACCENT BACKGROUND FOREGROUND RED; do
+    if [[ -n ${!key:-} ]] && ! valid_hex "${!key}"; then
+      printf '  ! %s is not a #rrggbb colour\n' "$key" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+ui_current_text() {
+  if [[ -n ${IMAGE:-} ]]; then
+    printf '%s' "${TEXT:-image only}"
+  else
+    printf '%s' "${TEXT:-(none)}"
+  fi
+}
+
+ui_font_label() {
+  if [[ -n ${FONT:-} ]]; then
+    printf 'custom · %s' "$(basename "$FONT")"
+  else
+    printf '%s' "$STYLE"
+  fi
+}
+
+ui_text() {
+  load_config
+  local value
+  value=$(ui_gum_input --header "Branding text · single line, up to 64 characters" \
+    --value "$TEXT" --placeholder "ACME" --width 64) || return 0
+
+  if [[ -z ${value// /} && -z ${IMAGE:-} ]]; then
+    printf '\n  ! the text cannot be empty unless an image is set\n'
+    ui_pause
+    return 0
+  fi
+  if [[ $value == @* || $value == *[$'\n\r\t']* ]] || (( ${#value} > 64 )); then
+    printf '\n  ! keep the text on one line, at most 64 characters, without a leading @\n'
+    ui_pause
+    return 0
+  fi
+
+  config_set TEXT "$value"
+  printf '\n  saved TEXT=%q — choose Apply now to install it\n' "$value"
+
+  local font
+  if font=$(font_for_style 2>/dev/null); then
+    if ! font_problem "$font" >/dev/null 2>&1; then
+      printf '  ! the current font cannot draw this text; change it under Font\n'
+    fi
+  fi
+}
+
+ui_font() {
+  load_config
+  local choice family file font problem header
+  local -a options=(
+    "Narrow$(ui_check "$STYLE" narrow)"
+    "Heavy$(ui_check "$STYLE" heavy)"
+    "Wide$(ui_check "$STYLE" wide)"
+    "Serif$(ui_check "$STYLE" serif)"
+    "Mono$(ui_check "$STYLE" mono)"
+    "Choose a font file…"
+    "Pick a system font family…"
+  )
+  [[ -n ${FONT:-} ]] && options+=("Clear the custom font ($(basename "$FONT"))")
+
+  header="Wordmark font · $(ui_font_label)"
+  if font=$(font_for_style 2>/dev/null) && ! font_problem "$font" >/dev/null 2>&1; then
+    header+=' · cannot draw this text'
+  fi
+
+  choice=$(ui_gum_choose --height 12 --header "$header" "${options[@]}") || return 0
+  case $choice in
+  Narrow*) config_set STYLE narrow; config_set FONT "" ;;
+  Heavy*) config_set STYLE heavy; config_set FONT "" ;;
+  Wide*) config_set STYLE wide; config_set FONT "" ;;
+  Serif*) config_set STYLE serif; config_set FONT "" ;;
+  Mono*) config_set STYLE mono; config_set FONT "" ;;
+  "Choose a font file…")
+    file=$(ui_gum_file --file --all /usr/share/fonts --height 16 --header "Pick a .ttf or .otf") || return 0
+    [[ -f $file ]] || return 0
+    case ${file,,} in
+    *.ttf | *.otf | *.ttc) ;;
+    *)
+      printf '\n  ! %s is not a .ttf, .otf or .ttc file\n' "$file"
+      ui_pause
+      return 0
+      ;;
+    esac
+    if ! problem=$(font_problem "$file"); then
+      printf '\n  ! %s\n' "$problem"
+      printf '    icon fonts (for example omarchy.ttf) contain symbols, not letters\n'
+      ui_pause
+      return 0
+    fi
+    config_set FONT "$file"
+    config_set STYLE custom
+    ;;
+  "Pick a system font family…")
+    family=$(fc-list : family 2>/dev/null | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+      grep -v '^$' | sort -u | ui_gum_filter --height 16 --header "Font family") || return 0
+    [[ -n $family ]] || return 0
+    file=$(fc-match -f '%{file}\n' "${family}:bold" | head -n1)
+    [[ -f $file ]] || {
+      printf '\n  ! could not resolve a font file for %s\n' "$family"
+      ui_pause
+      return 0
+    }
+    if ! problem=$(font_problem "$file"); then
+      printf '\n  ! %s\n' "$problem"
+      printf '    choose a text family rather than a symbol or icon font\n'
+      ui_pause
+      return 0
+    fi
+    config_set FONT "$file"
+    config_set STYLE custom
+    ;;
+  "Clear the custom font"*)
+    config_set FONT ""
+    [[ $STYLE == custom ]] && config_set STYLE narrow
+    ;;
+  esac
+  printf '\n  saved the font — choose Apply now to install it\n'
+}
+
+ui_image() {
+  load_config
+  local choice file tint
+  tint=${IMAGE_TINT:-false}
+  local -a options=()
+  [[ -n ${IMAGE:-} ]] && options+=("Text wordmark (no image)")
+  options+=("Choose an image file…")
+  if [[ -n ${IMAGE:-} ]]; then
+    options+=("Tint with the accent ($([[ $tint == true ]] && printf on || printf off))")
+    options+=("Clear the image ($(basename "$IMAGE"))")
+  fi
+
+  choice=$(ui_gum_choose --height 10 --header "Logo source · ${IMAGE:-text wordmark}" "${options[@]}") || return 0
+  case $choice in
+  "Text wordmark"*)
+    config_set IMAGE ""
+    ;;
+  "Choose an image file…")
+    if command -v omarchy-file-select >/dev/null 2>&1; then
+      file=$(omarchy-file-select --title "Branding image" --extensions "png svg jpg jpeg webp" 2>/dev/null) || return 0
+    else
+      file=$(ui_gum_file --file --all "$HOME" --height 16 --header "Pick a PNG, SVG, JPEG or WebP") || return 0
+    fi
+    [[ -f $file ]] || return 0
+    if ! magick identify -format '%w %h' "$file" >/dev/null 2>&1; then
+      printf '\n  ! %s is not an image ImageMagick can read\n' "$file"
+      ui_pause
+      return 0
+    fi
+    config_set IMAGE "$file"
+    ;;
+  "Tint with the accent"*)
+    if [[ $tint == true ]]; then
+      config_set IMAGE_TINT false
+    else
+      config_set IMAGE_TINT true
+    fi
+    ;;
+  "Clear the image"*)
+    config_set IMAGE ""
+    ;;
+  esac
+  printf '\n  saved the image setting — choose Apply now to install it\n'
+}
+
+ui_pick_hex() {
+  local prompt=$1 current=$2 value
+  local picker
+  picker=$(ui_gum_choose --height 6 --header "$prompt" "Type a hex value…" "Pick from the screen…" "Cancel") || return 1
+  case $picker in
+  "Type a hex value…")
+    value=$(ui_gum_input --header "$prompt (#rrggbb)" --placeholder "$current" --width 20) || return 1
+    [[ -n $value ]] || return 1
+    ;;
+  "Pick from the screen…")
+    command -v hyprpicker >/dev/null 2>&1 || {
+      printf '  ! hyprpicker is not installed\n' >&2
+      return 1
+    }
+    value=$(hyprpicker -a -b -f hex -l 2>/dev/null) || true
+    [[ -n $value ]] || {
+      printf '  ! no colour was picked\n' >&2
+      return 1
+    }
+    ;;
+  *) return 1 ;;
+  esac
+
+  if ! valid_hex "$value"; then
+    printf '  ! %s is not a #rrggbb colour\n' "$value" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+ui_colour_edit() {
+  local key=$1 value
+  value=$(ui_pick_hex "$key" "${!key-}") || {
+    ui_pause
+    return 0
+  }
+  config_set "$key" "$value"
+  printf '\n  saved %s=%s — choose Apply now to install it\n' "$key" "$value"
+  ui_pause
+}
+
+ui_colours() {
+  load_config
+  ui_validate_colours || return 0
+  resolve_colors
+
+  local mode
+  mode=$(ui_gum_choose --height 6 --header "Colour source · $COLORS" \
+    "Follow the Omarchy theme$(ui_check "$COLORS" theme)" \
+    "Fixed colours$(ui_check "$COLORS" fixed)" \
+    "Back") || return 0
+
+  case $mode in
+  "Follow the Omarchy theme"*)
+    config_set COLORS theme
+    printf '\n  saved COLORS=theme — choose Apply now to install it\n'
+    ui_pause
+    return 0
+    ;;
+  "Back") return 0 ;;
+  esac
+
+  # Seed the manual palette with what is on screen right now, so switching to
+  # fixed colours changes nothing until a value is edited.
+  local key
+  for key in ACCENT BACKGROUND FOREGROUND RED; do
+    if [[ -z ${!key-} ]]; then
+      case $key in
+      ACCENT) config_set ACCENT "$ACCENT_RESOLVED" ;;
+      BACKGROUND) config_set BACKGROUND "$BACKGROUND_RESOLVED" ;;
+      FOREGROUND) config_set FOREGROUND "$FOREGROUND_RESOLVED" ;;
+      RED) config_set RED "$RED_RESOLVED" ;;
+      esac
+    fi
+  done
+  config_set COLORS fixed
+  load_config
+  ui_validate_colours || return 0
+  resolve_colors
+
+  while true; do
+    local choice
+    choice=$(ui_gum_choose --height 10 --header "Fixed colours · accent ${ACCENT_RESOLVED}" \
+      "Accent        ${ACCENT_RESOLVED}" \
+      "Background    ${BACKGROUND_RESOLVED}" \
+      "Foreground    ${FOREGROUND_RESOLVED}" \
+      "Failure red   ${RED_RESOLVED}" \
+      "Boot menu     ${BOOTMENU_COLOR:-${ACCENT_RESOLVED#\#}}" \
+      "Back to theme colours" \
+      "Done") || return 0
+
+    case $choice in
+    "Accent"*) ui_colour_edit ACCENT ;;
+    "Background"*) ui_colour_edit BACKGROUND ;;
+    "Foreground"*) ui_colour_edit FOREGROUND ;;
+    "Failure red"*) ui_colour_edit RED ;;
+    "Boot menu"*)
+      local value
+      value=$(ui_pick_hex "BOOTMENU_COLOR (six hex digits, no #)" "${BOOTMENU_COLOR:-${ACCENT_RESOLVED#\#}}") || {
+        ui_pause
+        continue
+      }
+      config_set BOOTMENU_COLOR "${value#\#}"
+      printf '\n  saved BOOTMENU_COLOR=%s — choose Apply now to install it\n' "${value#\#}"
+      ui_pause
+      ;;
+    "Back to theme colours")
+      config_set COLORS theme
+      printf '\n  saved COLORS=theme — choose Apply now to install it\n'
+      ui_pause
+      return 0
+      ;;
+    "Done") return 0 ;;
+    esac
+    load_config
+    ui_validate_colours || return 0
+    resolve_colors
+  done
+}
+
+ui_surfaces() {
+  load_config
+  local -a all=(session login splash bootmenu)
+  local -a selected=() picked=()
+  local s out joined=""
+
+  for s in "${all[@]}"; do
+    want_surface "$s" && selected+=("$s")
+  done
+
+  local -a choose_args=(--no-limit --height 8 --header "Surfaces to brand")
+  (( ${#selected[@]} > 0 )) && choose_args+=(--selected "$(IFS=,; printf '%s' "${selected[*]}")")
+
+  out=$(ui_gum_choose "${choose_args[@]}" "${all[@]}") || return 0
+  mapfile -t picked <<<"$out"
+
+  for s in "${all[@]}"; do
+    local p
+    for p in "${picked[@]}"; do
+      [[ $p == "$s" ]] && joined=${joined:+$joined,}$s && break
+    done
+  done
+  [[ -n $joined ]] || {
+    printf '\n  ! keep at least one surface enabled\n'
+    ui_pause
+    return 0
+  }
+
+  config_set SURFACES "$joined"
+  printf '\n  saved SURFACES=%s — choose Apply now to install it\n' "$joined"
+}
+
+ui_edit_value() {
+  local key=$1 label=$2 placeholder=$3 value
+  value=$(ui_gum_input --header "$label" --value "${!key-}" --placeholder "$placeholder" --width 30) || return 1
+  printf '%s' "$value"
+}
+
+ui_advanced() {
+  load_config
+  local choice value
+  while true; do
+    choice=$(ui_gum_choose --height 14 --header "Advanced" \
+      "Logo size          $LOGO_SIZE" \
+      "Letter spacing     $LETTER_SPACING" \
+      "Art size           ${ART_WIDTH}x${ART_HEIGHT} screensaver · ${ABOUT_WIDTH}x${ABOUT_HEIGHT} about" \
+      "Art threshold      ${ART_THRESHOLD}%" \
+      "Boot menu title    ${BOOTMENU_TITLE:-auto (upper-case text)}" \
+      "Follow theme       $FOLLOW_THEME" \
+      "Theme updates splash  $THEME_UPDATE_SPLASH" \
+      "Rebuild on apply   $REBUILD_INITRAMFS" \
+      "Done") || return 0
+
+    case $choice in
+    "Logo size"*)
+      value=$(ui_edit_value LOGO_SIZE "LOGO_SIZE (width x height)" "800x188") || continue
+      if [[ ! $value =~ ^[0-9]+x[0-9]+$ ]]; then
+        printf '\n  ! use WIDTHxHEIGHT, for example 800x188\n'
+      elif (( 10#${value%x*} < 64 || 10#${value%x*} > 4096 || 10#${value#*x} < 16 || 10#${value#*x} > 4096 )); then
+        printf '\n  ! keep the size between 64x16 and 4096x4096\n'
+      else
+        config_set LOGO_SIZE "$value"
+      fi
+      ;;
+    "Letter spacing"*)
+      value=$(ui_edit_value LETTER_SPACING "LETTER_SPACING in pixels (may be negative)" "0") || continue
+      if [[ ! $value =~ ^-?[0-9]+$ ]]; then
+        printf '\n  ! letter spacing must be a whole number\n'
+      else
+        config_set LETTER_SPACING "$value"
+      fi
+      ;;
+    "Art size"*)
+      value=$(ui_edit_value ART_WIDTH "Screensaver width in columns" "81") || continue
+      [[ $value =~ ^[0-9]+$ ]] && config_set ART_WIDTH "$value"
+      value=$(ui_edit_value ART_HEIGHT "Screensaver height in rows" "10") || continue
+      [[ $value =~ ^[0-9]+$ ]] && config_set ART_HEIGHT "$value"
+      value=$(ui_edit_value ABOUT_WIDTH "About width in columns" "54") || continue
+      [[ $value =~ ^[0-9]+$ ]] && config_set ABOUT_WIDTH "$value"
+      value=$(ui_edit_value ABOUT_HEIGHT "About height in rows" "26") || continue
+      [[ $value =~ ^[0-9]+$ ]] && config_set ABOUT_HEIGHT "$value"
+      ;;
+    "Art threshold"*)
+      value=$(ui_edit_value ART_THRESHOLD "ART_THRESHOLD percent (0-100)" "50") || continue
+      if [[ $value =~ ^[0-9]+$ ]] && (( 10#$value >= 0 && 10#$value <= 100 )); then
+        config_set ART_THRESHOLD "$value"
+      else
+        printf '\n  ! the threshold must be from 0 to 100\n'
+      fi
+      ;;
+    "Boot menu title"*)
+      value=$(ui_edit_value BOOTMENU_TITLE "Boot menu title (blank = upper-case text)" "$TEXT") || continue
+      value=$(printf '%s' "$value" | LC_ALL=C sed 's/[^A-Za-z0-9 ._:+()&-]//g')
+      config_set BOOTMENU_TITLE "$value"
+      ;;
+    "Follow theme"*)
+      is_true "$FOLLOW_THEME" && config_set FOLLOW_THEME false || config_set FOLLOW_THEME true
+      ;;
+    "Theme updates splash"*)
+      is_true "$THEME_UPDATE_SPLASH" && config_set THEME_UPDATE_SPLASH false || config_set THEME_UPDATE_SPLASH true
+      ;;
+    "Rebuild on apply"*)
+      is_true "$REBUILD_INITRAMFS" && config_set REBUILD_INITRAMFS false || config_set REBUILD_INITRAMFS true
+      ;;
+    "Done") return 0 ;;
+    esac
+    ui_pause
+    load_config
+  done
+}
+
+ui_preview() {
+  local out status=0
+  out=$(mktemp) || return 0
+  ( cmd_preview ) >"$out" 2>&1 || status=$?
+  if (( status != 0 )); then
+    printf '\n  ! the preview failed:\n'
+    sed -n '1,8p' "$out" | sed 's/^/    /'
+    rm -f "$out"
+    ui_pause
+    return 0
+  fi
+  ui_gum_pager --soft-wrap <"$out"
+  rm -f "$out"
+}
+
+ui_apply() {
+  local args=()
+  if ui_gum_confirm "Embed the splash in the initramfs too? (about a minute)" \
+    --affirmative "Rebuild" --negative "Skip"; then
+    args+=(--rebuild)
+  else
+    args+=(--no-rebuild)
+  fi
+  ( cmd_apply "${args[@]}" ) || true
+  ui_pause
+}
+
+ui_reset() {
+  ui_gum_confirm "Restore the stock Omarchy branding?" --affirmative "Reset" --negative "Cancel" || return 0
+  ( cmd_reset ) || true
+  ui_pause
+}
+
+cmd_ui() {
+  case ${1:-} in
+  --help | -h | help)
+    usage
+    return 0
+    ;;
+  esac
+  ui_need_gum
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    die "the settings UI needs a terminal; run it in a terminal or use the subcommands"
+  fi
+
+  while true; do
+    load_config
+    ui_validate_colours || return 0
+    resolve_colors
+    local text style_label colour_label image_label choice
+    text=$(ui_current_text)
+    style_label=$(ui_font_label)
+    if [[ $COLORS == theme ]]; then
+      colour_label="theme · ${ACCENT_RESOLVED}"
+    else
+      colour_label="fixed · ${ACCENT_RESOLVED}"
+    fi
+    image_label=${IMAGE:+"$(basename "$IMAGE")"}
+    image_label=${image_label:-text only}
+
+    choice=$(ui_gum_choose --height 18 \
+      --header "Branding · $(theme_display_name) · $text" \
+      "Text          $text" \
+      "Font          $style_label" \
+      "Image         $image_label" \
+      "Colours       $colour_label" \
+      "Surfaces      $(surface_list)" \
+      "Advanced      sizes, tracking, boot title" \
+      "Preview" \
+      "Apply now" \
+      "Reset to stock Omarchy branding" \
+      "Quit") || return 0
+
+    case $choice in
+    "Text"*) ui_text ;;
+    "Font"*) ui_font ;;
+    "Image"*) ui_image ;;
+    "Colours"*) ui_colours ;;
+    "Surfaces"*) ui_surfaces ;;
+    "Advanced"*) ui_advanced ;;
+    "Preview") ui_preview ;;
+    "Apply now") ui_apply ;;
+    "Reset to stock"*) ui_reset ;;
+    "Quit") return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- dispatch
+
+command=${1:-}
+[[ $# -gt 0 ]] && shift
+
+case $command in
+"" | status) cmd_status ;;
+help | --help | -h | usage) usage ;;
+--version | version) printf '%s %s\n' "$PROG" "$VERSION" ;;
+set) cmd_set "$@" ;;
+ui | menu | edit | settings) cmd_ui "$@" ;;
+apply) cmd_apply "$@" ;;
+preview) cmd_preview "$@" ;;
+style) cmd_style "$@" ;;
+surface) cmd_surface "$@" ;;
+option | set-option) cmd_option "$@" ;;
+get) cmd_get "$@" ;;
+toggle) cmd_toggle "$@" ;;
+reset) cmd_reset "$@" ;;
+config | options) cmd_config "$@" ;;
+hook | _hook) cmd_hook ;;
+*)
+  # Bare text is the headline use: `omarchy branding text ACME`.
+  cmd_set "$command" "$@"
+  ;;
+esac

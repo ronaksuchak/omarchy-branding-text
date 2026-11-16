@@ -1,0 +1,33 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local configuration and rendered output
+config/config.local.conf
+*.conf.bak
+*.bak
+*.bak.*
+*.orig
+*.rej
+
+# Install artifacts (the real ones live outside the checkout)
+share/*.png
+share/*.jpg
+share/*.svg
+stage/
+art-source.png
+*.png.tmp
+
+# Logs and temp files
+*.log
+tmp/
